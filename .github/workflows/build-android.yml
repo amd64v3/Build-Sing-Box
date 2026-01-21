@@ -1,0 +1,222 @@
+name: Build Android 
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream sing-box ref (branch/tag/sha), e.g. main"
+        required: true
+        type: string
+        default: "dev-next"
+      version:
+        description: "Release version string (no leading v), e.g. 1.10.2-beta.15"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: "386"
+            arch_label: "386"
+            ndk: i686-linux-android23
+          - goarch: amd64
+            arch_label: amd64
+            ndk: x86_64-linux-android23
+          - goarch: arm
+            arch_label: arm
+            ndk: armv7a-linux-androideabi23
+          - goarch: arm64
+            arch_label: arm64
+            ndk: aarch64-linux-android23
+
+    env:
+      UPSTREAM: sagernet/sing-box
+      BUILD_TAGS: >-
+        with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0,with_naive_outbound
+      NDK_VERSION: r28
+
+    outputs:
+      upstream_sha: ${{ steps.meta.outputs.sha }}
+      build_ts: ${{ steps.meta.outputs.ts }}
+
+    steps:
+      - name: Checkout sing-box source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ inputs.upstream_ref }}
+          path: sing-box
+          fetch-depth: 0
+
+      - name: Compute metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sing-box
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.6
+          cache: true
+          cache-dependency-path: sing-box/go.sum
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          local-cache: true
+
+      - name: Set NDK env
+        run: |
+          echo "NDK_BIN=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_ENV
+
+      - name: Build and package (android/${{ matrix.goarch }})
+        working-directory: sing-box
+        env:
+          GOOS: android
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          set -xeuo pipefail
+
+          export CC="$NDK_BIN/${{ matrix.ndk }}-clang"
+          export CXX="$NDK_BIN/${{ matrix.ndk }}-clang++"
+
+          VERSION="${{ inputs.version }}"
+          ARCH="${{ matrix.arch_label }}"
+          PKG_NAME="sing-box-${VERSION}-android-${ARCH}"
+          TAR_NAME="${PKG_NAME}.tar.gz"
+
+          mkdir -p "../dist/${PKG_NAME}"
+
+          go build -v -trimpath \
+            -o "../dist/${PKG_NAME}/sing-box" \
+            -tags "${BUILD_TAGS}" \
+            -ldflags "-s -buildid= -X github.com/sagernet/sing-box/constant.Version=${VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0" \
+            ./cmd/sing-box
+
+          cp LICENSE "../dist/${PKG_NAME}/LICENSE"
+
+          pushd ../dist >/dev/null
+          tar -czf "${TAR_NAME}" "${PKG_NAME}"
+          rm -rf "${PKG_NAME}"
+          popd >/dev/null
+
+      - name: Upload artifact (tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-tar-${{ matrix.arch_label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+      BUILD_TAGS: >-
+        with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0,with_naive_outbound
+    steps:
+      - name: Download build tarballs
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release notes file
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf "Upstream ref: \`%s\`\n" "${{ inputs.upstream_ref }}" > release-notes.txt
+          printf "Upstream commit: \`%s\`\n" "${{ needs.build.outputs.upstream_sha }}" >> release-notes.txt
+          printf "Tags: \`%s\`\n" "${BUILD_TAGS}" >> release-notes.txt
+          cat release-notes.txt
+
+      - name: Ensure release exists (create if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release exists: ${RELEASE_TAG}"
+          else
+            gh release create -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file release-notes.txt
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" \
+            --title "${RELEASE_TAG}" \
+            --notes-file release-notes.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete existing assets with same names
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz; do
+            name="$(basename "$f")"
+            id="$(gh release view -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" --json assets -q ".assets[] | select(.name==\"${name}\") | .id" || true)"
+            if [[ -n "${id}" ]]; then
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" dist/*.tar.gz
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete workflow run artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          run_id="${GITHUB_RUN_ID}"
+
+          artifacts="$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${owner}/${repo}/actions/runs/${run_id}/artifacts" \
+            --jq '.artifacts[].id' || true)"
+
+          if [[ -z "${artifacts}" ]]; then
+            echo "No artifacts found for run ${run_id}"
+            exit 0
+          fi
+
+          for id in ${artifacts}; do
+            echo "Deleting artifact id=${id}"
+            gh api -X DELETE -H "Accept: application/vnd.github+json" \
+              "/repos/${owner}/${repo}/actions/artifacts/${id}"
+          done
