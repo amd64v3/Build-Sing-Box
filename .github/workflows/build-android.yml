@@ -172,26 +172,12 @@ jobs:
             --notes-file release-notes.txt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Delete existing assets with same names
-        shell: bash
-        run: |
-          set -euo pipefail
-          for f in dist/*.tar.gz; do
-            name="$(basename "$f")"
-            id="$(gh release view -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" --json assets -q ".assets[] | select(.name==\"${name}\") | .id" || true)"
-            if [[ -n "${id}" ]]; then
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}"
-            fi
-          done
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+          
       - name: Upload assets
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" dist/*.tar.gz
+          gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" dist/*.tar.gz --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
