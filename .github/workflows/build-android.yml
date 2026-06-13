@@ -7,16 +7,31 @@ on:
         description: "Upstream Sing-Box ref (branch/tag/sha), e.g. main"
         required: true
         type: string
-        default: "dev-next"
+        default: "testing"
+
       version:
         description: "Release version string (no leading v), e.g. 1.10.2-beta.15"
         required: true
         type: string
+
+      go_version:
+        description: "Go version for actions/setup-go, e.g. 1.25.10 or ~1.25.10"
+        required: true
+        type: string
+        default: "~1.25.11"
+
+      ndk_version:
+        description: "Android NDK version, e.g. r28"
+        required: true
+        type: string
+        default: "r28"
+
       pre_release:
         description: "Mark GitHub Release as pre-release"
         required: true
         type: boolean
         default: false
+
       build_tags:
         description: "Sing-Box build tags (comma-separated, no spaces), e.g. with_gvisor,with_quic"
         required: true
@@ -34,6 +49,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -54,15 +70,42 @@ jobs:
     env:
       UPSTREAM: sagernet/sing-box
       BUILD_TAGS: ${{ inputs.build_tags }}
-      NDK_VERSION: r28
+      GO_VERSION: ${{ inputs.go_version }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
 
     outputs:
       upstream_sha: ${{ steps.meta.outputs.sha }}
       build_ts: ${{ steps.meta.outputs.ts }}
 
     steps:
+      - name: Validate manual inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_required() {
+            local name="$1"
+            local value="$2"
+
+            if [[ -z "${value//[[:space:]]/}" ]]; then
+              echo "::error::Input '${name}' is required and cannot be empty."
+              exit 1
+            fi
+          }
+
+          check_required "upstream_ref" "${{ inputs.upstream_ref }}"
+          check_required "version" "${{ inputs.version }}"
+          check_required "go_version" "${{ inputs.go_version }}"
+          check_required "ndk_version" "${{ inputs.ndk_version }}"
+          check_required "build_tags" "${{ inputs.build_tags }}"
+
+          echo "Using upstream_ref=${{ inputs.upstream_ref }}"
+          echo "Using version=${{ inputs.version }}"
+          echo "Using go_version=${{ inputs.go_version }}"
+          echo "Using ndk_version=${{ inputs.ndk_version }}"
+
       - name: Checkout sing-box source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ inputs.upstream_ref }}
@@ -79,9 +122,9 @@ jobs:
           echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: ~1.25.10
+          go-version: ${{ env.GO_VERSION }}
           cache: false
           cache-dependency-path: sing-box/go.sum
 
@@ -93,8 +136,10 @@ jobs:
           local-cache: false
 
       - name: Set NDK env
+        shell: bash
         run: |
-          echo "NDK_BIN=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_ENV
+          set -euo pipefail
+          echo "NDK_BIN=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
 
       - name: Build and package (android/${{ matrix.goarch }})
         working-directory: sing-box
@@ -108,6 +153,8 @@ jobs:
           # Optional: strip spaces if user pasted tags with spaces
           BUILD_TAGS="${BUILD_TAGS// /}"
           echo "Using BUILD_TAGS=${BUILD_TAGS}"
+          echo "Using GO_VERSION=${GO_VERSION}"
+          echo "Using NDK_VERSION=${NDK_VERSION}"
 
           export CC="$NDK_BIN/${{ matrix.ndk }}-clang"
           export CXX="$NDK_BIN/${{ matrix.ndk }}-clang++"
@@ -133,7 +180,7 @@ jobs:
           popd >/dev/null
 
       - name: Upload artifact (tar.gz)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-tar-${{ matrix.arch_label }}
           path: dist/*.tar.gz
@@ -142,12 +189,16 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+
     env:
       RELEASE_TAG: v${{ inputs.version }}
       BUILD_TAGS: ${{ inputs.build_tags }}
+      GO_VERSION: ${{ inputs.go_version }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+
     steps:
       - name: Download build tarballs
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -157,6 +208,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ "${{ inputs.pre_release }}" == "true" ]]; then
             echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
           else
@@ -167,16 +219,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           BUILD_TAGS="${BUILD_TAGS// /}"
+
           printf "Upstream ref: \`%s\`\n" "${{ inputs.upstream_ref }}" > release-notes.txt
           printf "Upstream commit: \`%s\`\n" "${{ needs.build.outputs.upstream_sha }}" >> release-notes.txt
+          printf "Go version: \`%s\`\n" "${GO_VERSION}" >> release-notes.txt
+          printf "Android NDK version: \`%s\`\n" "${NDK_VERSION}" >> release-notes.txt
           printf "Tags: \`%s\`\n" "${BUILD_TAGS}" >> release-notes.txt
+
           cat release-notes.txt
 
       - name: Ensure release exists (create if missing)
         shell: bash
         run: |
           set -euo pipefail
+
           if gh release view -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "Release exists: ${RELEASE_TAG}"
           else
@@ -192,6 +250,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           gh release edit -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" \
             --title "${RELEASE_TAG}" \
             --notes-file release-notes.txt \
@@ -203,6 +262,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" dist/*.tar.gz --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -213,6 +273,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
           owner="${GITHUB_REPOSITORY%/*}"
           repo="${GITHUB_REPOSITORY#*/}"
           run_id="${GITHUB_RUN_ID}"
