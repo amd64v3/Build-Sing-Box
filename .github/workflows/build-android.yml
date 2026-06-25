@@ -136,6 +136,24 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           local-cache: false
 
+      - name: Set Android NDK env
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NDK_BIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK_BIN=${NDK_BIN}" >> "$GITHUB_ENV"
+          echo "${NDK_BIN}" >> "$GITHUB_PATH"
+
+          echo "setup-ndk ndk-path=${NDK_PATH}"
+          echo "NDK_BIN=${NDK_BIN}"
+
+          "${NDK_BIN}/aarch64-linux-android23-clang" --version
+
       - name: Set upstream build flags
         working-directory: sing-box
         shell: bash
@@ -143,7 +161,6 @@ jobs:
           set -euo pipefail
 
           BUILD_TAGS="${BUILD_TAGS// /}"
-
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
 
           echo "BUILD_TAGS=${BUILD_TAGS}" >> "$GITHUB_ENV"
@@ -157,9 +174,9 @@ jobs:
       - name: Build and package (android/${{ matrix.goarch }})
         working-directory: sing-box
         env:
+          GOOS: android
+          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "1"
-          BUILD_GOOS: android
-          BUILD_GOARCH: ${{ matrix.goarch }}
         run: |
           set -xeuo pipefail
 
@@ -168,14 +185,15 @@ jobs:
           PKG_NAME="sing-box-${VERSION}-android-${ARCH}"
           TAR_NAME="${PKG_NAME}.tar.gz"
 
-          go install -v ./cmd/internal/build
+          export CC="$NDK_BIN/${{ matrix.ndk }}-clang"
+          export CXX="$NDK_BIN/${{ matrix.ndk }}-clang++"
 
-          export CC='${{ matrix.ndk }}-clang'
-          export CXX="${CC}++"
+          echo "Using CC=${CC}"
+          "${CC}" --version
 
           mkdir -p "../dist/${PKG_NAME}"
 
-          GOOS=$BUILD_GOOS GOARCH=$BUILD_GOARCH build go build -v -trimpath \
+          go build -v -trimpath \
             -o "../dist/${PKG_NAME}/sing-box" \
             -tags "${BUILD_TAGS}" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
