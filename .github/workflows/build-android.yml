@@ -18,7 +18,7 @@ on:
         description: "Go version for actions/setup-go, e.g. 1.25.10"
         required: true
         type: string
-        default: "~1.25.11"
+        default: "1.26.5"
 
       ndk_version:
         description: "Android NDK version, e.g. r28"
@@ -75,6 +75,7 @@ jobs:
 
     outputs:
       upstream_sha: ${{ steps.meta.outputs.sha }}
+      upstream_commit_date: ${{ steps.meta.outputs.commit_date }}
       build_ts: ${{ steps.meta.outputs.ts }}
 
     steps:
@@ -120,6 +121,7 @@ jobs:
 
           cd sing-box
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
           echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Go
@@ -257,6 +259,64 @@ jobs:
 
           cat release-notes.txt
 
+      - name: Ensure release tag has its own timestamped commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_COMMIT_DATE: ${{ needs.build.outputs.upstream_commit_date }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+
+          if gh api "/repos/${owner}/${repo}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag exists: ${RELEASE_TAG}"
+            exit 0
+          fi
+
+          default_branch="$(gh api "/repos/${owner}/${repo}" --jq '.default_branch')"
+          base_sha="$(gh api "/repos/${owner}/${repo}/git/ref/heads/${default_branch}" --jq '.object.sha')"
+          tree_sha="$(gh api "/repos/${owner}/${repo}/git/commits/${base_sha}" --jq '.tree.sha')"
+
+          commit_payload="$(jq -nc \
+            --arg message "Release metadata for ${RELEASE_TAG}" \
+            --arg tree "${tree_sha}" \
+            --arg parent "${base_sha}" \
+            --arg date "${UPSTREAM_COMMIT_DATE}" \
+            '{
+              message: $message,
+              tree: $tree,
+              parents: [$parent],
+              author: {
+                name: "github-actions[bot]",
+                email: "41898282+github-actions[bot]@users.noreply.github.com",
+                date: $date
+              },
+              committer: {
+                name: "github-actions[bot]",
+                email: "41898282+github-actions[bot]@users.noreply.github.com",
+                date: $date
+              }
+            }')"
+
+          release_commit_sha="$(gh api -X POST \
+            "/repos/${owner}/${repo}/git/commits" \
+            --input - \
+            --jq '.sha' <<<"${commit_payload}")"
+
+          ref_payload="$(jq -nc \
+            --arg ref "refs/tags/${RELEASE_TAG}" \
+            --arg sha "${release_commit_sha}" \
+            '{ref: $ref, sha: $sha}')"
+
+          gh api -X POST \
+            "/repos/${owner}/${repo}/git/refs" \
+            --input - <<<"${ref_payload}" >/dev/null
+
+          echo "Created ${RELEASE_TAG} -> ${release_commit_sha}"
+          echo "Release sort timestamp: ${UPSTREAM_COMMIT_DATE}"
+
       - name: Ensure release exists (create if missing)
         shell: bash
         run: |
@@ -266,6 +326,7 @@ jobs:
             echo "Release exists: ${RELEASE_TAG}"
           else
             gh release create -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" \
+              --verify-tag \
               --title "${RELEASE_TAG}" \
               --notes-file release-notes.txt \
               ${{ steps.flags.outputs.flag }}
