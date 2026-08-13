@@ -3,6 +3,21 @@ name: Build & Release Android Binary
 on:
   workflow_dispatch:
     inputs:
+      source_repository:
+        description: "Source repository"
+        required: true
+        type: choice
+        default: "Sing-Box Official"
+        options:
+          - "Sing-Box Official"
+          - "Custom Repository"
+
+      custom_repository:
+        description: "Required only for Custom Repository (owner/repo)"
+        required: false
+        type: string
+        default: ""
+
       upstream_ref:
         description: "Upstream Sing-Box ref (branch/tag/sha), e.g. master"
         required: true
@@ -68,7 +83,6 @@ jobs:
             ndk: aarch64-linux-android23
 
     env:
-      UPSTREAM: sagernet/sing-box
       BUILD_TAGS: ${{ inputs.build_tags }}
       GO_VERSION: ${{ inputs.go_version }}
       NDK_VERSION: ${{ inputs.ndk_version }}
@@ -79,8 +93,10 @@ jobs:
       build_ts: ${{ steps.meta.outputs.ts }}
 
     steps:
-      - name: Validate manual inputs
+      - name: Validate manual inputs and resolve source
         shell: bash
+        env:
+          CUSTOM_REPOSITORY: ${{ inputs.custom_repository }}
         run: |
           set -euo pipefail
 
@@ -100,6 +116,27 @@ jobs:
           check_required "ndk_version" "${{ inputs.ndk_version }}"
           check_required "build_tags" "${{ inputs.build_tags }}"
 
+          if [[ "${{ inputs.source_repository }}" == "Sing-Box Official" ]]; then
+            echo "UPSTREAM=SagerNet/sing-box" >> "$GITHUB_ENV"
+            echo "SOURCE_TYPE=official" >> "$GITHUB_ENV"
+          else
+            custom_repository="${CUSTOM_REPOSITORY//[[:space:]]/}"
+
+            if [[ -z "${custom_repository}" ]]; then
+              echo "::error::Custom Repository is required when Source repository is set to Custom Repository."
+              exit 1
+            fi
+
+            if [[ ! "${custom_repository}" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
+              echo "::error::Custom Repository must use the owner/repo format."
+              exit 1
+            fi
+
+            echo "UPSTREAM=${custom_repository}" >> "$GITHUB_ENV"
+            echo "SOURCE_TYPE=custom" >> "$GITHUB_ENV"
+          fi
+
+          echo "Using source type=${{ inputs.source_repository }}"
           echo "Using upstream_ref=${{ inputs.upstream_ref }}"
           echo "Using version=${{ inputs.version }}"
           echo "Using go_version=${{ inputs.go_version }}"
@@ -251,7 +288,13 @@ jobs:
 
           BUILD_TAGS="${BUILD_TAGS// /}"
 
-          printf "Upstream ref: \`%s\`\n" "${{ inputs.upstream_ref }}" > release-notes.txt
+          if [[ "${{ inputs.source_repository }}" == "Sing-Box Official" ]]; then
+            printf "Source: \`official\`\n" > release-notes.txt
+            printf "Upstream ref: \`%s\`\n" "${{ inputs.upstream_ref }}" >> release-notes.txt
+          else
+            printf "Source: \`custom\`\n" > release-notes.txt
+          fi
+
           printf "Upstream commit: \`%s\`\n" "${{ needs.build.outputs.upstream_sha }}" >> release-notes.txt
           printf "Go version: \`%s\`\n" "${GO_VERSION}" >> release-notes.txt
           printf "Android NDK version: \`%s\`\n" "${NDK_VERSION}" >> release-notes.txt
