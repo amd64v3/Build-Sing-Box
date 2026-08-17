@@ -33,7 +33,7 @@ on:
         description: "Go version for actions/setup-go, e.g. 1.25.10"
         required: true
         type: string
-        default: "1.26.5"
+        default: "1.26.6"
 
       ndk_version:
         description: "Android NDK version, e.g. r28"
@@ -261,6 +261,8 @@ jobs:
       BUILD_TAGS: ${{ inputs.build_tags }}
       GO_VERSION: ${{ inputs.go_version }}
       NDK_VERSION: ${{ inputs.ndk_version }}
+      PRE_RELEASE_KEEP: "10"
+      FULL_RELEASE_KEEP: "5"
 
     steps:
       - name: Download build tarballs
@@ -434,3 +436,79 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Cleanup old releases and tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Release retention policy:"
+          echo "  Pre-releases: keep ${PRE_RELEASE_KEEP}"
+          echo "  Full releases: keep ${FULL_RELEASE_KEEP}"
+          echo "  Draft releases: never delete"
+
+          releases="$(
+            gh release list \
+              -R "${GITHUB_REPOSITORY}" \
+              --limit 1000 \
+              --json tagName,isPrerelease,isDraft,createdAt,publishedAt
+          )"
+
+          mapfile -t old_prereleases < <(
+            jq -r \
+              --argjson keep "${PRE_RELEASE_KEEP}" '
+                [
+                  .[]
+                  | select(
+                      .isDraft == false
+                      and .isPrerelease == true
+                    )
+                ]
+                | sort_by([.createdAt, .publishedAt, .tagName])
+                | reverse
+                | .[$keep:]
+                | .[].tagName
+              ' <<<"${releases}"
+          )
+
+          mapfile -t old_full_releases < <(
+            jq -r \
+              --argjson keep "${FULL_RELEASE_KEEP}" '
+                [
+                  .[]
+                  | select(
+                      .isDraft == false
+                      and .isPrerelease == false
+                    )
+                ]
+                | sort_by([.createdAt, .publishedAt, .tagName])
+                | reverse
+                | .[$keep:]
+                | .[].tagName
+              ' <<<"${releases}"
+          )
+
+          echo "Old pre-releases to delete: ${#old_prereleases[@]}"
+          echo "Old full releases to delete: ${#old_full_releases[@]}"
+
+          for tag in "${old_prereleases[@]}"; do
+            echo "Deleting old pre-release and tag: ${tag}"
+            gh release delete \
+              -R "${GITHUB_REPOSITORY}" \
+              "${tag}" \
+              --cleanup-tag \
+              --yes
+          done
+
+          for tag in "${old_full_releases[@]}"; do
+            echo "Deleting old full release and tag: ${tag}"
+            gh release delete \
+              -R "${GITHUB_REPOSITORY}" \
+              "${tag}" \
+              --cleanup-tag \
+              --yes
+          done
+
+          echo "Release cleanup completed."
