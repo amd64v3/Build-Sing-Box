@@ -1,4 +1,4 @@
-name: Build & Release Android Binary
+name: Build & Release Linux Binary
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
         default: "testing"
 
       version:
-        description: "Release version string (no leading v), e.g. 1.10.2-beta.15"
+        description: "Release version string (no leading v), e.g. 1.14.0-beta.17"
         required: true
         type: string
 
@@ -34,12 +34,6 @@ on:
         required: true
         type: string
         default: "1.26.6"
-
-      ndk_version:
-        description: "Android NDK version, e.g. r28"
-        required: true
-        type: string
-        default: "r28"
 
       pre_release:
         description: "Mark GitHub Release as pre-release"
@@ -63,29 +57,22 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goarch: "386"
-            arch_label: "386"
-            ndk: i686-linux-android23
           - goarch: amd64
             arch_label: amd64
-            ndk: x86_64-linux-android23
-          - goarch: arm
-            arch_label: arm
-            ndk: armv7a-linux-androideabi23
+            debian_arch: amd64
           - goarch: arm64
             arch_label: arm64
-            ndk: aarch64-linux-android23
+            debian_arch: arm64
 
     env:
       BUILD_TAGS: ${{ inputs.build_tags }}
       GO_VERSION: ${{ inputs.go_version }}
-      NDK_VERSION: ${{ inputs.ndk_version }}
 
     outputs:
       upstream_sha: ${{ steps.meta.outputs.sha }}
@@ -113,7 +100,6 @@ jobs:
           check_required "upstream_ref" "${{ inputs.upstream_ref }}"
           check_required "version" "${{ inputs.version }}"
           check_required "go_version" "${{ inputs.go_version }}"
-          check_required "ndk_version" "${{ inputs.ndk_version }}"
           check_required "build_tags" "${{ inputs.build_tags }}"
 
           if [[ "${{ inputs.source_repository }}" == "Sing-Box Official" ]]; then
@@ -140,7 +126,6 @@ jobs:
           echo "Using upstream_ref=${{ inputs.upstream_ref }}"
           echo "Using version=${{ inputs.version }}"
           echo "Using go_version=${{ inputs.go_version }}"
-          echo "Using ndk_version=${{ inputs.ndk_version }}"
 
       - name: Checkout sing-box source
         uses: actions/checkout@v5
@@ -152,11 +137,11 @@ jobs:
 
       - name: Compute metadata
         id: meta
+        working-directory: sing-box
         shell: bash
         run: |
           set -euo pipefail
 
-          cd sing-box
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "commit_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
           echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -168,88 +153,232 @@ jobs:
           cache: false
           cache-dependency-path: sing-box/go.sum
 
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: ${{ env.NDK_VERSION }}
-          local-cache: false
-
-      - name: Set Android NDK env
+      - name: Set local version tag
+        working-directory: sing-box
         shell: bash
         run: |
           set -euo pipefail
+          git tag "v${{ inputs.version }}" -f
 
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          NDK_BIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+      - name: Clone cronet-go
+        working-directory: sing-box
+        shell: bash
+        run: |
+          set -xeuo pipefail
 
-          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
-          echo "NDK=${NDK_PATH}" >> "$GITHUB_ENV"
-          echo "NDK_BIN=${NDK_BIN}" >> "$GITHUB_ENV"
-          echo "${NDK_BIN}" >> "$GITHUB_PATH"
+          CRONET_GO_VERSION="$(cat .github/CRONET_GO_VERSION)"
+          rm -rf "$HOME/cronet-go"
+          git init "$HOME/cronet-go"
+          git -C "$HOME/cronet-go" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$HOME/cronet-go" sparse-checkout set --no-cone '/*' '!/lib'
+          git -C "$HOME/cronet-go" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$HOME/cronet-go" checkout FETCH_HEAD
+          git -C "$HOME/cronet-go" submodule update --init --recursive --depth=1
 
-          echo "setup-ndk ndk-path=${NDK_PATH}"
-          echo "NDK_BIN=${NDK_BIN}"
+      - name: Regenerate Debian keyring
+        shell: bash
+        run: |
+          set -xeuo pipefail
 
-          "${NDK_BIN}/aarch64-linux-android23-clang" --version
+          rm -f "$HOME/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg"
+          cd "$HOME/cronet-go"
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
 
-      - name: Set upstream build flags
+      - name: Set shared Linux build flags
         working-directory: sing-box
         shell: bash
         run: |
           set -euo pipefail
 
-          BUILD_TAGS="${BUILD_TAGS// /}"
+          BASE_BUILD_TAGS="${BUILD_TAGS// /}"
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
 
-          echo "BUILD_TAGS=${BUILD_TAGS}" >> "$GITHUB_ENV"
+          echo "BASE_BUILD_TAGS=${BASE_BUILD_TAGS}" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=${LDFLAGS_SHARED}" >> "$GITHUB_ENV"
 
-          echo "Using BUILD_TAGS=${BUILD_TAGS}"
+          echo "Using BASE_BUILD_TAGS=${BASE_BUILD_TAGS}"
           echo "Using LDFLAGS_SHARED=${LDFLAGS_SHARED}"
           echo "Using GO_VERSION=${GO_VERSION}"
-          echo "Using NDK_VERSION=${NDK_VERSION}"
 
-      - name: Build and package (android/${{ matrix.goarch }})
+      - name: Download Chromium glibc toolchain
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive \
+            --target=linux/${{ matrix.goarch }} \
+            download-toolchain
+
+      - name: Save Chromium glibc toolchain environment
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive \
+            --target=linux/${{ matrix.goarch }} \
+            env > "$RUNNER_TEMP/cronet-glibc.env"
+
+          cat "$RUNNER_TEMP/cronet-glibc.env"
+
+      - name: Build Linux glibc binary (${{ matrix.goarch }})
         working-directory: sing-box
+        shell: bash
         env:
-          GOOS: android
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xeuo pipefail
+
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            key="${line%%=*}"
+            value="${line#*=}"
+            export "${key}=${value}"
+          done < "$RUNNER_TEMP/cronet-glibc.env"
+
+          mkdir -p dist-glibc
+
+          go build -v -trimpath \
+            -o dist-glibc/sing-box \
+            -tags "${BASE_BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+          file dist-glibc/sing-box
+
+      - name: Package glibc binary tar.gz
+        working-directory: sing-box
+        shell: bash
         run: |
           set -xeuo pipefail
 
           VERSION="${{ inputs.version }}"
           ARCH="${{ matrix.arch_label }}"
-          PKG_NAME="sing-box-${VERSION}-android-${ARCH}"
-          TAR_NAME="${PKG_NAME}.tar.gz"
+          DIR_NAME="sing-box-${VERSION}-linux-${ARCH}-glibc"
 
-          export CC="$NDK_BIN/${{ matrix.ndk }}-clang"
-          export CXX="$NDK_BIN/${{ matrix.ndk }}-clang++"
-
-          echo "Using CC=${CC}"
-          "${CC}" --version
-
-          mkdir -p "../dist/${PKG_NAME}"
-
-          go build -v -trimpath \
-            -o "../dist/${PKG_NAME}/sing-box" \
-            -tags "${BUILD_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-            ./cmd/sing-box
-
-          cp LICENSE "../dist/${PKG_NAME}/LICENSE"
+          mkdir -p "../dist/${DIR_NAME}"
+          cp LICENSE "../dist/${DIR_NAME}/LICENSE"
+          cp dist-glibc/sing-box "../dist/${DIR_NAME}/sing-box"
 
           pushd ../dist >/dev/null
-          tar -czf "${TAR_NAME}" "${PKG_NAME}"
-          rm -rf "${PKG_NAME}"
+          tar -czf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -rf "${DIR_NAME}"
           popd >/dev/null
 
-      - name: Upload artifact (tar.gz)
+      - name: Download Chromium musl toolchain
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive \
+            --target=linux/${{ matrix.goarch }} \
+            --libc=musl \
+            download-toolchain
+
+      - name: Save Chromium musl toolchain environment
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive \
+            --target=linux/${{ matrix.goarch }} \
+            --libc=musl \
+            env > "$RUNNER_TEMP/cronet-musl.env"
+
+          cat "$RUNNER_TEMP/cronet-musl.env"
+
+      - name: Build Linux musl binary (${{ matrix.goarch }})
+        working-directory: sing-box
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xeuo pipefail
+
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            key="${line%%=*}"
+            value="${line#*=}"
+            export "${key}=${value}"
+          done < "$RUNNER_TEMP/cronet-musl.env"
+
+          MUSL_BUILD_TAGS="${BASE_BUILD_TAGS}"
+          if [[ ",${MUSL_BUILD_TAGS}," != *",with_musl,"* ]]; then
+            MUSL_BUILD_TAGS="${MUSL_BUILD_TAGS},with_musl"
+          fi
+
+          mkdir -p dist-musl
+
+          go build -v -trimpath \
+            -o dist-musl/sing-box \
+            -tags "${MUSL_BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+          file dist-musl/sing-box
+
+      - name: Package musl binary tar.gz
+        working-directory: sing-box
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          VERSION="${{ inputs.version }}"
+          ARCH="${{ matrix.arch_label }}"
+          DIR_NAME="sing-box-${VERSION}-linux-${ARCH}-musl"
+
+          mkdir -p "../dist/${DIR_NAME}"
+          cp LICENSE "../dist/${DIR_NAME}/LICENSE"
+          cp dist-musl/sing-box "../dist/${DIR_NAME}/sing-box"
+
+          pushd ../dist >/dev/null
+          tar -czf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -rf "${DIR_NAME}"
+          popd >/dev/null
+
+      - name: Package unsigned DEB from musl binary
+        working-directory: sing-box
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          VERSION="${{ inputs.version }}"
+          PKG_VERSION="${VERSION//-/\~}"
+
+          sudo gem install fpm
+          cp .fpm_systemd .fpm
+
+          mkdir -p ../dist
+          fpm -t deb \
+            -v "${PKG_VERSION}" \
+            -p "../dist/sing-box_${VERSION}_linux_${{ matrix.debian_arch }}_unsigned.deb" \
+            --architecture "${{ matrix.debian_arch }}" \
+            dist-musl/sing-box=/usr/bin/sing-box
+
+      - name: Verify packaged files
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          ls -lh dist
+          dpkg-deb --info "dist/sing-box_${{ inputs.version }}_linux_${{ matrix.debian_arch }}_unsigned.deb"
+
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: android-tar-${{ matrix.arch_label }}
-          path: dist/*.tar.gz
+          name: linux-${{ matrix.arch_label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
           if-no-files-found: error
 
   release:
@@ -264,12 +393,11 @@ jobs:
       RELEASE_TAG: v${{ inputs.version }}
       BUILD_TAGS: ${{ inputs.build_tags }}
       GO_VERSION: ${{ inputs.go_version }}
-      NDK_VERSION: ${{ inputs.ndk_version }}
       PRE_RELEASE_KEEP: "10"
       FULL_RELEASE_KEEP: "5"
 
     steps:
-      - name: Download build tarballs
+      - name: Download Linux builds
         uses: actions/download-artifact@v8
         with:
           path: dist
@@ -287,16 +415,20 @@ jobs:
             echo "flag=--latest" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create Android release section
+      - name: Create Linux release section
         shell: bash
         run: |
           set -euo pipefail
 
-          BUILD_TAGS="${BUILD_TAGS// /}"
+          BASE_BUILD_TAGS="${BUILD_TAGS// /}"
+          MUSL_BUILD_TAGS="${BASE_BUILD_TAGS}"
+          if [[ ",${MUSL_BUILD_TAGS}," != *",with_musl,"* ]]; then
+            MUSL_BUILD_TAGS="${MUSL_BUILD_TAGS},with_musl"
+          fi
 
           {
-            printf '<!-- BEGIN ANDROID -->\n'
-            printf 'Android:\n\n'
+            printf '<!-- BEGIN LINUX -->\n'
+            printf 'Linux:\n\n'
 
             if [[ "${{ inputs.source_repository }}" == "Sing-Box Official" ]]; then
               printf 'Source: `official`\n'
@@ -307,9 +439,9 @@ jobs:
             fi
 
             printf 'Go version: `%s`\n' "${GO_VERSION}"
-            printf 'Android NDK version: `%s`\n' "${NDK_VERSION}"
-            printf 'Tags: `%s`\n' "${BUILD_TAGS}"
-            printf '<!-- END ANDROID -->\n'
+            printf 'Tags (glibc): `%s`\n' "${BASE_BUILD_TAGS}"
+            printf 'Tags (musl): `%s`\n' "${MUSL_BUILD_TAGS}"
+            printf '<!-- END LINUX -->\n'
           } > platform-section.md
 
           cat platform-section.md
@@ -318,7 +450,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PLATFORM: ANDROID
+          PLATFORM: LINUX
         run: |
           set -euo pipefail
 
@@ -425,6 +557,8 @@ jobs:
 
       - name: Ensure release exists (create if missing)
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -437,11 +571,11 @@ jobs:
               --notes-file release-notes.txt \
               ${{ steps.flags.outputs.flag }}
           fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update release notes
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -449,17 +583,23 @@ jobs:
             --title "${RELEASE_TAG}" \
             --notes-file release-notes.txt \
             ${{ steps.flags.outputs.flag }}
+
+      - name: Upload Linux assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload assets
-        shell: bash
         run: |
           set -euo pipefail
 
-          gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" dist/*.tar.gz --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.deb)
+
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::No Linux release assets found."
+            exit 1
+          fi
+
+          gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${assets[@]}" --clobber
 
       - name: Delete workflow run artifacts
         shell: bash

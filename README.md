@@ -1,1 +1,1 @@
-Build Sing-Box Android binary with custom tags.
+Build Sing-Box with custom tags.
