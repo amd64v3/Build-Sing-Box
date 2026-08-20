@@ -413,6 +413,29 @@ jobs:
         run: |
           set -euo pipefail
 
+          RAW_BUILD_TAGS="${BUILD_TAGS// /}"
+
+          IFS=',' read -ra TAG_ARRAY <<< "${RAW_BUILD_TAGS}"
+          UNIQUE_TAGS=()
+
+          for tag in "${TAG_ARRAY[@]}"; do
+            [[ -z "${tag}" ]] && continue
+
+            found=false
+            for existing in "${UNIQUE_TAGS[@]}"; do
+              if [[ "${existing}" == "${tag}" ]]; then
+                found=true
+                break
+              fi
+            done
+
+            if [[ "${found}" == "false" ]]; then
+              UNIQUE_TAGS+=("${tag}")
+            fi
+          done
+
+          DISPLAY_TAGS="$(IFS=,; echo "${UNIQUE_TAGS[*]}")"
+
           {
             printf '<!-- BEGIN LINUX -->\n'
             printf 'Linux:\n\n'
@@ -426,7 +449,7 @@ jobs:
             fi
 
             printf 'Go version: `%s`\n' "${GO_VERSION}"
-            printf 'Tags: `%s`\n' "${BASE_BUILD_TAGS}"
+            printf 'Tags: `%s`\n' "${DISPLAY_TAGS}"
             printf '\nNote:\n'
             printf 'musl variant is built with the additional tag `with_musl`.\n'
             printf '<!-- END LINUX -->\n'
