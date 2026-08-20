@@ -199,7 +199,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          BUILD_TAGS="${BUILD_TAGS// /}"
+          RAW_BUILD_TAGS="${BUILD_TAGS// /}"
+
+          IFS=',' read -ra TAG_ARRAY <<< "${RAW_BUILD_TAGS}"
+          UNIQUE_TAGS=()
+
+          for tag in "${TAG_ARRAY[@]}"; do
+            [[ -z "${tag}" ]] && continue
+
+            found=false
+            for existing in "${UNIQUE_TAGS[@]}"; do
+              if [[ "${existing}" == "${tag}" ]]; then
+                found=true
+                break
+              fi
+            done
+
+            if [[ "${found}" == "false" ]]; then
+              UNIQUE_TAGS+=("${tag}")
+            fi
+          done
+
+          BUILD_TAGS="$(IFS=,; echo "${UNIQUE_TAGS[*]}")"
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
 
           echo "BUILD_TAGS=${BUILD_TAGS}" >> "$GITHUB_ENV"

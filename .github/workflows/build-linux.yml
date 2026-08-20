@@ -190,7 +190,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE_BUILD_TAGS="${BUILD_TAGS// /}"
+          RAW_BUILD_TAGS="${BUILD_TAGS// /}"
+
+          IFS=',' read -ra TAG_ARRAY <<< "${RAW_BUILD_TAGS}"
+          UNIQUE_TAGS=()
+
+          for tag in "${TAG_ARRAY[@]}"; do
+            [[ -z "${tag}" ]] && continue
+
+            found=false
+            for existing in "${UNIQUE_TAGS[@]}"; do
+              if [[ "${existing}" == "${tag}" ]]; then
+                found=true
+                break
+              fi
+            done
+
+            if [[ "${found}" == "false" ]]; then
+              UNIQUE_TAGS+=("${tag}")
+            fi
+          done
+
+          BASE_BUILD_TAGS="$(IFS=,; echo "${UNIQUE_TAGS[*]}")"
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
 
           echo "BASE_BUILD_TAGS=${BASE_BUILD_TAGS}" >> "$GITHUB_ENV"
@@ -345,40 +366,12 @@ jobs:
           rm -rf "${DIR_NAME}"
           popd >/dev/null
 
-      - name: Package unsigned DEB from musl binary
-        working-directory: sing-box
-        shell: bash
-        run: |
-          set -xeuo pipefail
-
-          VERSION="${{ inputs.version }}"
-          PKG_VERSION="${VERSION//-/\~}"
-
-          sudo gem install fpm
-          cp .fpm_systemd .fpm
-
-          mkdir -p ../dist
-          fpm -t deb \
-            -v "${PKG_VERSION}" \
-            -p "../dist/sing-box_${VERSION}_linux_${{ matrix.debian_arch }}_unsigned.deb" \
-            --architecture "${{ matrix.debian_arch }}" \
-            dist-musl/sing-box=/usr/bin/sing-box
-
-      - name: Verify packaged files
-        shell: bash
-        run: |
-          set -xeuo pipefail
-
-          ls -lh dist
-          dpkg-deb --info "dist/sing-box_${{ inputs.version }}_linux_${{ matrix.debian_arch }}_unsigned.deb"
-
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.arch_label }}
           path: |
             dist/*.tar.gz
-            dist/*.deb
           if-no-files-found: error
 
   release:
@@ -420,12 +413,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE_BUILD_TAGS="${BUILD_TAGS// /}"
-          MUSL_BUILD_TAGS="${BASE_BUILD_TAGS}"
-          if [[ ",${MUSL_BUILD_TAGS}," != *",with_musl,"* ]]; then
-            MUSL_BUILD_TAGS="${MUSL_BUILD_TAGS},with_musl"
-          fi
-
           {
             printf '<!-- BEGIN LINUX -->\n'
             printf 'Linux:\n\n'
@@ -439,8 +426,9 @@ jobs:
             fi
 
             printf 'Go version: `%s`\n' "${GO_VERSION}"
-            printf 'Tags (glibc): `%s`\n' "${BASE_BUILD_TAGS}"
-            printf 'Tags (musl): `%s`\n' "${MUSL_BUILD_TAGS}"
+            printf 'Tags: `%s`\n' "${BASE_BUILD_TAGS}"
+            printf '\nNote:\n'
+            printf 'musl variant is built with the additional tag `with_musl`.\n'
             printf '<!-- END LINUX -->\n'
           } > platform-section.md
 
